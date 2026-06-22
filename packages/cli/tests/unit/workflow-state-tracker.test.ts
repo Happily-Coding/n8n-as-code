@@ -254,21 +254,28 @@ export class OrderIdWorkflow {
 });
 
 describe('WorkflowStateTracker drift detection', () => {
+    // Helper that creates a tracker with a pre-seeded local hash map,
+    // bypassing WorkflowTransformerAdapter.hashWorkflow (the full transform
+    // pipeline is exercised by integration tests, not here). This isolates the
+    // drift-detection logic under test.
     let tempDir: string | undefined;
     let mockClient: N8nApiClient;
+    let remoteUpdatedAtValue: string | undefined;
 
     const writeWorkflowFile = (id: string, name: string) => {
         const ts = [
             "import { workflow } from '@n8n-as-code/transformer';",
             '',
-            `// @workflow({ id: "${id}", name: "${name}" })`,
+            `@workflow({ id: "${id}", name: "${name}" })`,
             'export {};',
             '',
         ].join('\n');
         fs.writeFileSync(path.join(tempDir!, `${name}.workflow.ts`), ts, 'utf-8');
     };
 
-    const writeState = (entries: Record<string, { lastSyncedHash: string; lastSyncedAt: string }>) => {
+    const writeState = (
+        entries: Record<string, { lastSyncedHash: string; lastSyncedAt?: string; filename?: string }>,
+    ) => {
         fs.writeFileSync(
             path.join(tempDir!, '.n8n-state.json'),
             JSON.stringify({ workflows: entries }, null, 2),
@@ -276,12 +283,17 @@ describe('WorkflowStateTracker drift detection', () => {
         );
     };
 
+    const seedLocalHash = (tracker: any, filename: string, hash: string) => {
+        // Pre-populate the private cache that refreshLocalState would normally fill.
+        // The drift logic only reads from this cache, so seeding it directly is safe.
+        tracker.localHashes.set(filename, hash);
+    };
+
     beforeEach(() => {
         vi.resetAllMocks();
         tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'n8nac-drift-'));
+        remoteUpdatedAtValue = '2026-06-16T22:45:28.755Z';
 
-        // Default mock: a single remote workflow with updatedAt = 2026-06-16T22:45:28.755Z.
-        // Individual tests override this via mockClient re-assignment + tracker recreation.
         mockClient = {
             getAllWorkflows: vi.fn().mockResolvedValue([
                 {
@@ -289,7 +301,7 @@ describe('WorkflowStateTracker drift detection', () => {
                     name: 'Carousel',
                     active: true,
                     isArchived: false,
-                    updatedAt: '2026-06-16T22:45:28.755Z',
+                    updatedAt: remoteUpdatedAtValue,
                 } as IWorkflow,
             ]),
         } as any;
@@ -318,6 +330,7 @@ describe('WorkflowStateTracker drift detection', () => {
 
         const tracker = createTracker();
         await tracker.refreshLocalState();
+        seedLocalHash(tracker, 'Carousel.workflow.ts', 'real-local-hash');
         await tracker.refreshRemoteState();
         const results = await tracker.getLightweightList();
 
@@ -332,17 +345,17 @@ describe('WorkflowStateTracker drift detection', () => {
 
     it('reports drift.local=true when local file hash differs from lastSyncedHash', async () => {
         writeWorkflowFile('wf-1', 'Carousel');
-        // lastSyncedHash is intentionally different from the hash that
-        // refreshLocalState will compute from the freshly-written file.
         writeState({
             'wf-1': {
-                lastSyncedHash: 'old-hash-that-will-not-match',
+                lastSyncedHash: 'old-hash-from-previous-pull',
                 lastSyncedAt: '2026-06-16T22:25:13.933Z',
+                filename: 'Carousel.workflow.ts',
             },
         });
 
         const tracker = createTracker();
         await tracker.refreshLocalState();
+        seedLocalHash(tracker, 'Carousel.workflow.ts', 'new-local-hash-after-edit');
         await tracker.refreshRemoteState();
         const results = await tracker.getLightweightList();
 
@@ -353,22 +366,18 @@ describe('WorkflowStateTracker drift detection', () => {
 
     it('reports drift.remote=false when remote updatedAt equals lastSyncedAt', async () => {
         writeWorkflowFile('wf-1', 'Carousel');
-        // We need the local hash to match lastSyncedHash to isolate the
-        // remote-timestamp branch. Pull the hash that refreshLocalState
-        // will compute by running it first, then re-seed state with it.
-        const probeTracker = createTracker();
-        await probeTracker.refreshLocalState();
-        const localHash = Array.from((probeTracker as any).localHashes.values())[0] as string;
-
         writeState({
             'wf-1': {
-                lastSyncedHash: localHash,
-                lastSyncedAt: '2026-06-16T22:45:28.755Z', // == remote updatedAt
+                lastSyncedHash: 'matching-local-hash',
+                // Same as mock remote.updatedAt => no remote drift.
+                lastSyncedAt: '2026-06-16T22:45:28.755Z',
+                filename: 'Carousel.workflow.ts',
             },
         });
 
         const tracker = createTracker();
         await tracker.refreshLocalState();
+        seedLocalHash(tracker, 'Carousel.workflow.ts', 'matching-local-hash');
         await tracker.refreshRemoteState();
         const results = await tracker.getLightweightList();
 
@@ -377,20 +386,18 @@ describe('WorkflowStateTracker drift detection', () => {
 
     it('reports drift.remote=true when remote updatedAt is newer than lastSyncedAt', async () => {
         writeWorkflowFile('wf-1', 'Carousel');
-        const probeTracker = createTracker();
-        await probeTracker.refreshLocalState();
-        const localHash = Array.from((probeTracker as any).localHashes.values())[0] as string;
-
-        // Local matches lastSyncedHash, but remote moved on after the last sync.
         writeState({
             'wf-1': {
-                lastSyncedHash: localHash,
-                lastSyncedAt: '2026-06-16T22:25:13.933Z', // older than remote 22:45:28.755
+                lastSyncedHash: 'matching-local-hash',
+                // Older than mock remote.updatedAt => remote drift.
+                lastSyncedAt: '2026-06-16T22:25:13.933Z',
+                filename: 'Carousel.workflow.ts',
             },
         });
 
         const tracker = createTracker();
         await tracker.refreshLocalState();
+        seedLocalHash(tracker, 'Carousel.workflow.ts', 'matching-local-hash');
         await tracker.refreshRemoteState();
         const results = await tracker.getLightweightList();
 
@@ -412,21 +419,20 @@ describe('WorkflowStateTracker drift detection', () => {
         expect(results[0].remoteUpdatedAt).toBeUndefined();
     });
 
-    it('cache remote updatedAt in remoteTimestamps when refreshRemoteState runs', async () => {
+    it('caches remote updatedAt in remoteTimestamps when refreshRemoteState runs', async () => {
         writeWorkflowFile('wf-1', 'Carousel');
         const tracker = createTracker();
         await tracker.refreshLocalState();
         await tracker.refreshRemoteState();
 
-        // Internal check: remoteTimestamps is now populated.
         const timestamps = (tracker as any).remoteTimestamps as Map<string, string>;
         expect(timestamps.get('wf-1')).toBe('2026-06-16T22:45:28.755Z');
     });
 
     it('does not populate drift when state has lastSyncedHash but no lastSyncedAt', async () => {
-        // Defensive: should never happen in practice (finalizeSync always
-        // writes both), but if it does we should not crash and should
-        // skip drift rather than compute a partial signal.
+        // Defensive: should never happen in practice (finalizeSync always writes both),
+        // but if it does we should not crash and should skip drift rather than
+        // compute a partial signal.
         writeWorkflowFile('wf-1', 'Carousel');
         fs.writeFileSync(
             path.join(tempDir!, '.n8n-state.json'),
@@ -438,9 +444,11 @@ describe('WorkflowStateTracker drift detection', () => {
 
         const tracker = createTracker();
         await tracker.refreshLocalState();
+        seedLocalHash(tracker, 'Carousel.workflow.ts', 'whatever');
         await tracker.refreshRemoteState();
         const results = await tracker.getLightweightList();
 
         expect(results[0].drift).toBeUndefined();
     });
 });
+

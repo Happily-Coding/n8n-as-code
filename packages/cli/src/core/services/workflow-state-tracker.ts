@@ -4,7 +4,7 @@ import EventEmitter from 'events';
 import { N8nApiClient } from './n8n-api-client.js';
 import { WorkflowTransformerAdapter } from './workflow-transformer-adapter.js';
 import { HashUtils } from './hash-utils.js';
-import { WorkflowSyncStatus, IWorkflowStatus, IWorkflow } from '../types.js';
+import { WorkflowSyncStatus, IWorkflowStatus, IWorkflow, IWorkflowDrift } from '../types.js';
 import { IWorkflowState, IInstanceState } from './state-manager.js';
 
 const WINDOWS_RESERVED_FILENAMES = new Set([
@@ -291,6 +291,11 @@ export class WorkflowStateTracker extends EventEmitter {
                 // Store active and archived flags from API
                 this.remoteActive.set(wf.id, wf.active === true);
                 this.remoteArchived.set(wf.id, wf.isArchived === true);
+                // Cache remote updatedAt for cheap drift detection in getLightweightList.
+                // The lightweight `list` path cannot afford a per-workflow hash compare,
+                // but `updatedAt` (already returned by /api/v1/workflows) is enough to
+                // detect "remote changed since last sync" without an extra API call.
+                if (wf.updatedAt) this.remoteTimestamps.set(wf.id, wf.updatedAt);
 
                 // CRITICAL: Use ID-based mapping with PERSISTED state as source of truth
                 let filename: string | undefined = this.idToFileMap.get(wf.id);
@@ -839,6 +844,14 @@ export class WorkflowStateTracker extends EventEmitter {
                 || this.readJsonFile(path.join(this.directory, filename))?.name
                 || filename.replace('.workflow.ts', '');
 
+            // Cheap drift signal: only computed when both reference state and the
+            // remote `updatedAt` from this refresh are available. See computeDrift().
+            // `remoteKnown` already implies `workflowId` is defined (see above), so the
+            // non-null assertion is safe and keeps this branch narrow.
+            const drift = remoteKnown && workflowId
+                ? this.computeDrift(filename, workflowId, state, this.remoteTimestamps.get(workflowId))
+                : undefined;
+
             results.set(filename, {
                 id: workflowId || '',
                 name: workflowName,
@@ -848,7 +861,10 @@ export class WorkflowStateTracker extends EventEmitter {
                 projectId: undefined, // Not available in lightweight mode
                 projectName: undefined, // Not available in lightweight mode
                 homeProject: undefined, // Not available in lightweight mode
-                isArchived
+                isArchived,
+                drift,
+                lastSyncedAt: workflowId ? state.workflows[workflowId]?.lastSyncedAt : undefined,
+                remoteUpdatedAt: workflowId ? this.remoteTimestamps.get(workflowId) : undefined,
             });
         }
 
@@ -885,6 +901,44 @@ export class WorkflowStateTracker extends EventEmitter {
         }
 
         return Array.from(results.values());
+    }
+
+    /**
+     * Cheap drift computation for the lightweight `list` path.
+     *
+     * Single source of truth (SSOT) for the "did either side change since last sync?"
+     * question when a remote hash is not yet cached (i.e. before `n8nac fetch <id>`
+     * runs the expensive per-workflow hash roundtrip).
+     *
+     * Returns `undefined` when there is no reference state for the workflow
+     * (never pulled / first sync), so consumers can distinguish "no drift known"
+     * from "drift checked and nothing changed".
+     *
+     * Cost: O(1) Map lookups + 2 string compares. No AST, no I/O, no extra API calls.
+     * The data sources are already populated by the existing lightweight refresh:
+     *   - `localHashes[filename]`  - populated by `refreshLocalState`
+     *   - `state.workflows[id]`    - read from `.n8n-state.json`
+     *   - `remoteTimestamp`        - returned by `/api/v1/workflows` (now cached by
+     *                                `refreshRemoteState` into `remoteTimestamps`)
+     */
+    private computeDrift(
+        filename: string,
+        workflowId: string,
+        state: IInstanceState,
+        remoteTimestamp: string | undefined,
+    ): IWorkflowDrift | undefined {
+        const baseState = state.workflows[workflowId];
+        const lastSyncedHash = baseState?.lastSyncedHash;
+        const lastSyncedAt = baseState?.lastSyncedAt;
+        if (!lastSyncedHash || !lastSyncedAt) return undefined;
+
+        const localHash = this.localHashes.get(filename);
+        return {
+            local: localHash !== undefined && localHash !== lastSyncedHash,
+            // ISO 8601 timestamps sort lexically the same as chronologically, so a
+            // simple `>` is sufficient. Missing `remoteTimestamp` => not drifted.
+            remote: remoteTimestamp !== undefined && remoteTimestamp > lastSyncedAt,
+        };
     }
 
     /**

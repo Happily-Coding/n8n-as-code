@@ -421,7 +421,9 @@ export class SyncEngine {
      * Tightened from the original `'folder'` substring match (which would have
      * silently swallowed unrelated 400/404 errors) to require either a
      * structured `parentFolderId` / `parentFolder` field in the response body,
-     * or a message that explicitly mentions one of those tokens.
+     * a message that explicitly mentions one of those tokens, or n8n's generic
+     * top-level additional-property validation error. Callers invoke this only
+     * when `parentFolderId` was added to an otherwise valid workflow payload.
      */
     private isUnsupportedParentFolderError(error: any): boolean {
         const status = error?.response?.status;
@@ -429,6 +431,8 @@ export class SyncEngine {
 
         const PARENT_FOLDER_PATTERN = /(parentfolderid|parent folder id|parentfolder)/i;
         const PARENT_FOLDER_KEYS = new Set(['parentfolderid', 'parentfolder']);
+        const GENERIC_ADDITIONAL_PROPERTY_PATTERN =
+            /^request\/body must not have additional properties$/i;
 
         const data = error?.response?.data;
         if (data && typeof data === 'object' && !Array.isArray(data)) {
@@ -437,6 +441,7 @@ export class SyncEngine {
             }
             const dataMessage = String(data.message ?? '').toLowerCase();
             if (PARENT_FOLDER_PATTERN.test(dataMessage)) return true;
+            if (GENERIC_ADDITIONAL_PROPERTY_PATTERN.test(dataMessage)) return true;
             return false;
         }
 

@@ -451,6 +451,50 @@ describe('SyncEngine update payload folderSync behavior', () => {
         expect(callSnapshots[1].payload).not.toHaveProperty('parentFolderId');
     });
 
+    it('retries update without parentFolderId for n8n generic additional-property validation', async () => {
+        vi.spyOn(WorkflowTransformerAdapter, 'compileToJson').mockResolvedValue({
+            name: 'Existing Workflow',
+            nodes: [{ id: 'n1' }],
+            connections: {},
+        } as any);
+        vi.spyOn(WorkflowTransformerAdapter, 'convertToTypeScript').mockResolvedValue('// generated');
+
+        const genericSchemaError: any = new Error('Request failed with status code 400');
+        genericSchemaError.response = {
+            status: 400,
+            data: { message: 'request/body must NOT have additional properties' },
+        };
+
+        const callSnapshots: Array<{ id: string; payload: any }> = [];
+        const updateWorkflow = vi.fn(async (id: string, payload: any) => {
+            callSnapshots.push({ id, payload: { ...payload } });
+            if (callSnapshots.length === 1) throw genericSchemaError;
+            return { ...payload, id, updatedAt: '2026-06-23T00:00:00.000Z' };
+        });
+        const getFolders = vi.fn(async () => []);
+        const createFolder = vi.fn(async (_projectId, payload) => ({
+            id: 'folder-x',
+            name: payload.name,
+            parentFolderId: payload.parentFolderId,
+        }));
+
+        const { engine, filename, workflowId } = updateEngine({
+            projectId: 'project-1',
+            updateWorkflow,
+            filename: 'X/existing.workflow.ts',
+            folderSync: true,
+            getFolders,
+            createFolder,
+            workflowId: 'wf-existing',
+        });
+
+        await expect(engine.push(filename, workflowId)).resolves.toBe(workflowId);
+
+        expect(updateWorkflow).toHaveBeenCalledTimes(2);
+        expect(callSnapshots[0].payload).toEqual(expect.objectContaining({ parentFolderId: 'folder-x' }));
+        expect(callSnapshots[1].payload).not.toHaveProperty('parentFolderId');
+    });
+
     it('does NOT retry when n8n returns a generic 400 mentioning only "folder" (regression guard)', async () => {
         vi.spyOn(WorkflowTransformerAdapter, 'compileToJson').mockResolvedValue({
             name: 'Existing Workflow',

@@ -284,4 +284,68 @@ describe('AI connections — one sub-node per input index', () => {
         expect(workflow.connections['Model']['ai_languageModel'][0][0].index).toBe(0);
         expect(workflow.connections['Fallback Model']['ai_languageModel'][0][0].index).toBe(1);
     });
+
+    // The historical bug was iteration-order dependent: whichever source node was
+    // visited last overwrote the other, so a pull kept exactly one model and which
+    // one it kept flip-flopped with the JSON key order. Asserting only on the
+    // canonical order cannot see that, so run the same round-trip with the source
+    // keys and the node list reversed and require an identical result.
+    describe.each([
+        ['canonical order', false],
+        ['reversed source key and node order', true],
+    ])('pull is order-independent — %s', (_label, reverse) => {
+        const aiConn = (node: string, index: number) => ({
+            ai_languageModel: [[{ node, type: 'ai_languageModel', index }]]
+        });
+
+        const makeJson = () => {
+            const nodes = [
+                { id: '1', name: 'Agent', type: '@n8n/n8n-nodes-langchain.agent', typeVersion: 1, position: [0, 0], parameters: { needsFallback: true } },
+                { id: '2', name: 'Model', type: '@n8n/n8n-nodes-langchain.lmChatOpenAi', typeVersion: 1, position: [0, 200], parameters: {} },
+                { id: '3', name: 'Fallback Model', type: '@n8n/n8n-nodes-langchain.lmChatOpenAi', typeVersion: 1, position: [200, 200], parameters: {} },
+            ];
+            // Insertion order is what Object.entries() iterates, so building the
+            // object in the opposite order is what actually exercises the bug.
+            const connections: any = reverse
+                ? { 'Fallback Model': aiConn('Agent', 1), 'Model': aiConn('Agent', 0) }
+                : { 'Model': aiConn('Agent', 0), 'Fallback Model': aiConn('Agent', 1) };
+            return { id: 'wf', name: 'Fallback', active: false, nodes: reverse ? [...nodes].reverse() : nodes, connections } as any;
+        };
+
+        it('keeps both models, each on its own input index', async () => {
+            const ast = new JsonToAstParser().parse(makeJson());
+            expect(ast.nodes.find(n => n.propertyName === 'Agent')!.aiDependencies!.ai_languageModel)
+                .toEqual(['Model', 'FallbackModel']);
+        });
+
+        it('survives JSON → AST → TS → AST → JSON by exact edge multiset', async () => {
+            const json = makeJson();
+            const code = await new AstToTypeScriptGenerator().generate(new JsonToAstParser().parse(json));
+            const { workflow } = await build(code);
+
+            // (source, type, outputGroup, target, targetIndex) — names alone would
+            // pass even with both models wrongly landing on index 0.
+            const edges = (connections: any) => Object.entries(connections ?? {})
+                .flatMap(([source, byType]: [string, any]) => Object.entries(byType ?? {})
+                    .flatMap(([type, groups]: [string, any]) => (groups ?? [])
+                        .flatMap((group: any, groupIndex: number) => (group ?? [])
+                            .map((e: any) => `${source}|${type}|out${groupIndex}|${e.node}|in${e.index ?? 0}`))))
+                .sort();
+
+            expect(edges(workflow.connections)).toEqual(edges(json.connections));
+            expect(edges(workflow.connections)).toEqual([
+                'Fallback Model|ai_languageModel|out0|Agent|in1',
+                'Model|ai_languageModel|out0|Agent|in0',
+            ]);
+        });
+    });
+
+    it('still compiles the legacy scalar form to input index 0', async () => {
+        const { workflow } = await build(makeWorkflow(
+            `this.Agent.uses({ ai_languageModel: this.Model.output });`
+        ));
+        expect(workflow.connections['Model']['ai_languageModel'][0]).toHaveLength(1);
+        expect(workflow.connections['Model']['ai_languageModel'][0][0])
+            .toMatchObject({ node: 'Agent', type: 'ai_languageModel', index: 0 });
+    });
 });
